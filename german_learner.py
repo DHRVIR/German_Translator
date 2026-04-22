@@ -163,7 +163,7 @@ class GermanTextBrowser(QTextBrowser):
         # Apply new highlight
         fmt = QTextCharFormat()
         fmt.setBackground(QColor("#BFD7F5"))
-        fmt.setForeground(QColor("#0A4080"))
+        fmt.setForeground(QColor("#0A3060"))
         cursor.setCharFormat(fmt)
 
     def load_german_text(self, text):
@@ -459,6 +459,7 @@ class MainWindow(QMainWindow):
 
         self.reader = GermanTextBrowser()
         self.reader.setFont(QFont("", 13))
+        self.reader.setStyleSheet("QTextBrowser { color: #1A1A1A; background-color: #FFFFFF; }")
         self.reader.setVisible(False)
         self.reader.word_clicked.connect(self._on_word_clicked)
         in_layout.addWidget(self.reader)
