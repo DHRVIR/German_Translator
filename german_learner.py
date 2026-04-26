@@ -78,13 +78,35 @@ class LookupWorker(QThread):
     result_ready = pyqtSignal(dict)
     error        = pyqtSignal(str)
 
-    def __init__(self, word, api_key):
+    def __init__(self, text, is_phrase, api_key):
         super().__init__()
-        self.word    = word
-        self.api_key = api_key
+        self.text      = text
+        self.is_phrase = is_phrase
+        self.api_key   = api_key
 
     def run(self):
-        # ── Try Anthropic first ──────────────────
+        if self.is_phrase:
+            self._translate_phrase()
+        else:
+            self._lookup_word()
+
+    def _translate_phrase(self):
+        try:
+            from deep_translator import GoogleTranslator
+            translation = GoogleTranslator(source="de", target="en").translate(self.text)
+            data = {
+                "word":      self.text,
+                "pos":       "phrase",
+                "meaning":   translation,
+                "example_de": "",
+                "example_en": "",
+                "is_phrase":  True,
+            }
+            self.result_ready.emit(data)
+        except Exception as e:
+            self.error.emit(f"Translation failed: {e}")
+
+    def _lookup_word(self):
         try:
             import anthropic, json
             key = self.api_key or None
@@ -100,25 +122,26 @@ class LookupWorker(QThread):
                     "example_de (one natural German example sentence), "
                     "example_en (English translation of the example)."
                 ),
-                messages=[{"role": "user", "content": self.word}]
+                messages=[{"role": "user", "content": self.text}]
             )
             text = "".join(b.text for b in msg.content if hasattr(b, "text"))
             data = json.loads(text.strip())
+            data["is_phrase"] = False
             self.result_ready.emit(data)
             return
-        except Exception as e:
-            pass   # fall through to deep-translator
+        except Exception:
+            pass
 
-        # ── Fallback: deep-translator ────────────
         try:
             from deep_translator import GoogleTranslator
-            translation = GoogleTranslator(source="de", target="en").translate(self.word)
+            translation = GoogleTranslator(source="de", target="en").translate(self.text)
             data = {
-                "word":       self.word,
+                "word":       self.text,
                 "pos":        "—",
                 "meaning":    translation,
-                "example_de": "(Claude API not available — showing translation only)",
+                "example_de": "",
                 "example_en": "",
+                "is_phrase":  False,
             }
             self.result_ready.emit(data)
         except Exception as e2:
@@ -129,7 +152,7 @@ class LookupWorker(QThread):
 #  Clickable text area
 # ─────────────────────────────────────────────
 class GermanTextBrowser(QTextBrowser):
-    word_clicked = pyqtSignal(str)
+    text_selected = pyqtSignal(str, bool)   # (text, is_phrase)
 
     def __init__(self):
         super().__init__()
@@ -140,27 +163,39 @@ class GermanTextBrowser(QTextBrowser):
             Qt.TextInteractionFlag.TextSelectableByKeyboard
         )
         self.viewport().setCursor(QCursor(Qt.CursorShape.IBeamCursor))
-        self._last_highlighted = None
 
-    def mousePressEvent(self, e):
-        super().mousePressEvent(e)
-        if e.button() == Qt.MouseButton.LeftButton:
-            cursor = self.cursorForPosition(e.pos())
-            cursor.select(QTextCursor.SelectionType.WordUnderCursor)
-            word = cursor.selectedText().strip()
-            word = re.sub(r"[^\w\-äöüÄÖÜß]", "", word, flags=re.UNICODE)
-            if word and re.search(r"[a-zA-ZäöüÄÖÜß]", word):
-                self._highlight_word(cursor)
-                self.word_clicked.emit(word)
+    def mouseReleaseEvent(self, e):
+        super().mouseReleaseEvent(e)
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
 
-    def _highlight_word(self, cursor):
-        # Clear old highlight
+        cursor = self.textCursor()
+        selected = cursor.selectedText().strip()
+
+        # Multi-word selection
+        if selected and len(selected.split()) > 1:
+            selected = selected.replace("\u2029", " ").replace("\u2028", " ")
+            selected = re.sub(r"\s+", " ", selected).strip()
+            if re.search(r"[a-zA-ZäöüÄÖÜß]", selected):
+                self._highlight_cursor(cursor)
+                self.text_selected.emit(selected, True)
+            return
+
+        # Single word — use word-under-cursor for accuracy
+        wc = self.cursorForPosition(e.pos())
+        wc.select(QTextCursor.SelectionType.WordUnderCursor)
+        word = wc.selectedText().strip()
+        word = re.sub(r"[^\w\-äöüÄÖÜß]", "", word, flags=re.UNICODE)
+        if word and re.search(r"[a-zA-ZäöüÄÖÜß]", word):
+            self._highlight_cursor(wc)
+            self.text_selected.emit(word, False)
+
+    def _highlight_cursor(self, cursor):
         doc = self.document()
         clear_fmt = QTextCharFormat()
         full = QTextCursor(doc)
         full.select(QTextCursor.SelectionType.Document)
         full.setCharFormat(clear_fmt)
-        # Apply new highlight
         fmt = QTextCharFormat()
         fmt.setBackground(QColor("#BFD7F5"))
         fmt.setForeground(QColor("#0A3060"))
@@ -231,10 +266,11 @@ class LookupPanel(QFrame):
         layout.addWidget(self.save_btn)
         layout.addStretch()
 
-    def show_loading(self, word):
+    def show_loading(self, text, is_phrase=False):
         self.current_data = None
-        self.word_label.setText(word)
-        self.pos_label.setText("looking up…")
+        display = text if len(text) <= 40 else text[:38] + "…"
+        self.word_label.setText(display)
+        self.pos_label.setText("translating…" if is_phrase else "looking up…")
         self.meaning_label.setText("")
         self.example_frame.setVisible(False)
         self.save_btn.setEnabled(False)
@@ -242,22 +278,34 @@ class LookupPanel(QFrame):
 
     def show_result(self, data, already_saved):
         self.current_data = data
-        self.word_label.setText(data.get("word", ""))
-        self.pos_label.setText(data.get("pos", ""))
-        self.meaning_label.setText(data.get("meaning", ""))
-        ex_de = data.get("example_de", "")
-        ex_en = data.get("example_en", "")
-        if ex_de:
-            self.example_de.setText(ex_de)
-            self.example_en.setText(ex_en)
+        is_phrase = data.get("is_phrase", False)
+        word = data.get("word", "")
+        display = word if len(word) <= 40 else word[:38] + "…"
+        self.word_label.setText(display)
+        if is_phrase:
+            # Show original German in example box, translation as meaning
+            self.pos_label.setText("phrase translation")
+            self.meaning_label.setText(data.get("meaning", ""))
+            self.example_de.setText(word)
+            self.example_en.setText(data.get("meaning", ""))
             self.example_frame.setVisible(True)
         else:
-            self.example_frame.setVisible(False)
+            self.pos_label.setText(data.get("pos", ""))
+            self.meaning_label.setText(data.get("meaning", ""))
+            ex_de = data.get("example_de", "")
+            ex_en = data.get("example_en", "")
+            if ex_de:
+                self.example_de.setText(ex_de)
+                self.example_en.setText(ex_en)
+                self.example_frame.setVisible(True)
+            else:
+                self.example_frame.setVisible(False)
         if already_saved:
             self.save_btn.setText("✓ Already saved")
             self.save_btn.setEnabled(False)
         else:
-            self.save_btn.setText("+ Save to Vocabulary")
+            btn_text = "+ Save phrase" if is_phrase else "+ Save to Vocabulary"
+            self.save_btn.setText(btn_text)
             self.save_btn.setEnabled(True)
 
     def show_error(self, msg):
@@ -461,7 +509,7 @@ class MainWindow(QMainWindow):
         self.reader.setFont(QFont("", 13))
         self.reader.setStyleSheet("QTextBrowser { color: #1A1A1A; background-color: #FFFFFF; }")
         self.reader.setVisible(False)
-        self.reader.word_clicked.connect(self._on_word_clicked)
+        self.reader.text_selected.connect(self._on_text_selected)
         in_layout.addWidget(self.reader)
 
         left_split.addWidget(input_frame)
@@ -495,7 +543,7 @@ class MainWindow(QMainWindow):
         self.reader.setVisible(True)
         self.load_btn.setVisible(False)
         self.edit_btn.setVisible(True)
-        self.status.setText("Click any word to look it up")
+        self.status.setText("Click a word to look it up  |  Select multiple words to translate a phrase")
 
     def _switch_to_editor(self):
         self.editor.setVisible(True)
@@ -503,12 +551,13 @@ class MainWindow(QMainWindow):
         self.load_btn.setVisible(True)
         self.edit_btn.setVisible(False)
 
-    def _on_word_clicked(self, word):
-        self.status.setText(f"Looking up: {word}…")
-        self.lookup.show_loading(word)
+    def _on_text_selected(self, text, is_phrase):
+        label = "Translating phrase…" if is_phrase else f"Looking up: {text}…"
+        self.status.setText(label)
+        self.lookup.show_loading(text, is_phrase)
         if self.worker and self.worker.isRunning():
             self.worker.terminate()
-        self.worker = LookupWorker(word, self.api_bar.get_key())
+        self.worker = LookupWorker(text, is_phrase, self.api_bar.get_key())
         self.worker.result_ready.connect(self._on_lookup_result)
         self.worker.error.connect(self._on_lookup_error)
         self.worker.start()
