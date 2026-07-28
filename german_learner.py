@@ -3,37 +3,71 @@ German Learning Assistant — PyQt6 Desktop App
 Requirements: pip install PyQt6 deep-translator google-genai python-dotenv
 """
 
-import sys
-import re
-import sqlite3
+import sys, re, sqlite3, json, csv
 from pathlib import Path
-from google.genai import types
-from deep_translator import GoogleTranslator
-import json
-from google import genai
-from deep_translator import GoogleTranslator
-from PyQt6.QtWidgets import QFileDialog
-import csv
-
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QTextEdit, QTextBrowser, QPushButton, QLabel,
     QTableWidget, QTableWidgetItem, QHeaderView, QFrame,
-    QLineEdit, QMessageBox, QSizePolicy
+    QLineEdit, QMessageBox, QScrollArea, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import (
     QFont, QColor, QTextCursor, QTextCharFormat, QPalette, QCursor
 )
-
+from PyQt6.QtWidgets import QFileDialog
+from google.genai import types
+from google import genai
+from deep_translator import GoogleTranslator
 from dotenv import load_dotenv
 import os
 
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
 DB_PATH = Path.home() / ".german_learner_vocab.db"
 
+GEMINI_PROMPT = """You are an expert German language tutor.
+Return ONLY a valid raw JSON object — no markdown, no backticks, no explanation.
+
+Required fields (use null for fields that don't apply):
+{
+  "word": "",
+  "lemma": "",
+  "part_of_speech": "",
+  "context_meaning": "",
+  "other_meanings": [],
+  "gender": "",
+  "plural": "",
+  "conjugation": {"ich":"","du":"","er":"","wir":"","ihr":"","sie":"","past":"","perfect":"","separable":false},
+  "comparison": {"comparative":"","superlative":""},
+  "cefr_level": "",
+  "pronunciation": "",
+  "word_family": [],
+  "collocations": [],
+  "common_phrases": [],
+  "synonyms": [],
+  "antonyms": [],
+  "grammar_notes": "",
+  "common_mistakes": [],
+  "memory_tip": "",
+  "example_de": "",
+  "example_en": ""
+}
+
+Rules:
+- context_meaning: meaning IN the given sentence context
+- other_meanings: list of other common meanings (strings)
+- conjugation: only for verbs, null otherwise
+- comparison: only for adjectives, null otherwise
+- gender: only for nouns (der/die/das), null otherwise
+- cefr_level: A1/A2/B1/B2/C1/C2
+- pronunciation: IPA notation
+- word_family: list of related words with brief meaning e.g. ["lieben (to love)", "lieblich (lovely)"]
+- collocations: list of common collocations e.g. ["aus Liebe (out of love)"]
+- common_phrases: list of common phrases using this word
+- common_mistakes: list of strings describing typical learner errors
+- memory_tip: a short memorable tip to remember the word
+"""
 
 # ─────────────────────────────────────────────
 #  Database
@@ -43,32 +77,75 @@ class VocabDB:
         self.conn = sqlite3.connect(str(DB_PATH))
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS vocab (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                word       TEXT UNIQUE,
-                pos        TEXT,
-                meaning    TEXT,
-                example_de TEXT,
-                example_en TEXT,
-                added_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                word            TEXT UNIQUE,
+                lemma           TEXT,
+                part_of_speech  TEXT,
+                gender          TEXT,
+                plural          TEXT,
+                context_meaning TEXT,
+                other_meanings  TEXT,
+                cefr_level      TEXT,
+                pronunciation   TEXT,
+                synonyms        TEXT,
+                antonyms        TEXT,
+                word_family     TEXT,
+                collocations    TEXT,
+                common_phrases  TEXT,
+                grammar_notes   TEXT,
+                common_mistakes TEXT,
+                memory_tip      TEXT,
+                example_de      TEXT,
+                example_en      TEXT,
+                added_at        DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
         self.conn.commit()
+        self._migrate()
 
-    def save(self, word, pos, meaning, example_de, example_en):
+    def _migrate(self):
+        """Add new columns if upgrading from old schema."""
+        existing = {r[1] for r in self.conn.execute("PRAGMA table_info(vocab)")}
+        new_cols = {
+            "lemma":"TEXT","part_of_speech":"TEXT","gender":"TEXT","plural":"TEXT",
+            "context_meaning":"TEXT","other_meanings":"TEXT","cefr_level":"TEXT",
+            "pronunciation":"TEXT","synonyms":"TEXT","antonyms":"TEXT",
+            "word_family":"TEXT","collocations":"TEXT","common_phrases":"TEXT",
+            "grammar_notes":"TEXT","common_mistakes":"TEXT","memory_tip":"TEXT",
+        }
+        for col, typ in new_cols.items():
+            if col not in existing:
+                self.conn.execute(f"ALTER TABLE vocab ADD COLUMN {col} {typ}")
+        self.conn.commit()
+
+    def save(self, d):
+        def j(v): return json.dumps(v, ensure_ascii=False) if isinstance(v, (list,dict)) else (v or "")
         try:
-            self.conn.execute(
-                "INSERT OR IGNORE INTO vocab "
-                "(word, pos, meaning, example_de, example_en) VALUES (?,?,?,?,?)",
-                (word, pos, meaning, example_de, example_en)
-            )
+            self.conn.execute("""
+                INSERT OR IGNORE INTO vocab
+                (word,lemma,part_of_speech,gender,plural,context_meaning,other_meanings,
+                 cefr_level,pronunciation,synonyms,antonyms,word_family,collocations,
+                 common_phrases,grammar_notes,common_mistakes,memory_tip,example_de,example_en)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                d.get("word",""), d.get("lemma",""), d.get("part_of_speech",""),
+                d.get("gender",""), d.get("plural",""), d.get("context_meaning",""),
+                j(d.get("other_meanings",[])), d.get("cefr_level",""),
+                d.get("pronunciation",""), j(d.get("synonyms",[])),
+                j(d.get("antonyms",[])), j(d.get("word_family",[])),
+                j(d.get("collocations",[])), j(d.get("common_phrases",[])),
+                d.get("grammar_notes",""), j(d.get("common_mistakes",[])),
+                d.get("memory_tip",""), d.get("example_de",""), d.get("example_en",""),
+            ))
             self.conn.commit()
             return True
-        except Exception:
+        except Exception as e:
+            print("DB save error:", e)
             return False
 
     def all_words(self):
         cur = self.conn.execute(
-            "SELECT id, word, pos, meaning, example_de, example_en "
+            "SELECT id,word,part_of_speech,context_meaning,cefr_level,example_de,example_en "
             "FROM vocab ORDER BY added_at DESC"
         )
         return cur.fetchall()
@@ -78,14 +155,12 @@ class VocabDB:
         self.conn.commit()
 
     def exists(self, word):
-        cur = self.conn.execute(
-            "SELECT 1 FROM vocab WHERE LOWER(word)=LOWER(?)", (word,)
-        )
+        cur = self.conn.execute("SELECT 1 FROM vocab WHERE LOWER(word)=LOWER(?)", (word,))
         return cur.fetchone() is not None
 
 
 # ─────────────────────────────────────────────
-#  Background worker
+#  Worker
 # ─────────────────────────────────────────────
 class LookupWorker(QThread):
     result_ready = pyqtSignal(dict)
@@ -94,7 +169,7 @@ class LookupWorker(QThread):
     def __init__(self, text, context_sentence, is_phrase):
         super().__init__()
         self.text             = text
-        self.context_sentence = context_sentence   # full sentence the word sits in
+        self.context_sentence = context_sentence
         self.is_phrase        = is_phrase
 
     def run(self):
@@ -106,124 +181,63 @@ class LookupWorker(QThread):
         except Exception as e:
             self.error.emit(f"Unexpected error: {e}")
 
-    # ── Phrase: deep-translator only (fast, no API needed) ────────────────
     def _translate_phrase(self):
         try:
             translation = GoogleTranslator(source="de", target="en").translate(self.text)
             self.result_ready.emit({
-                "word":       self.text,
-                "pos":        "phrase",
-                "meaning":    translation,
-                "example_de": "",
-                "example_en": "",
-                "is_phrase":  True,
-                "source":     "Google Translate",
+                "word": self.text, "is_phrase": True,
+                "context_meaning": translation, "source": "Google Translate",
             })
         except Exception as e:
             self.error.emit(f"Translation failed: {e}")
 
-    # ── Single word: try Gemini (with context), fall back to deep-translator ──
     def _lookup_word(self):
         if GEMINI_API_KEY:
             result = self._try_gemini()
             if result:
                 self.result_ready.emit(result)
                 return
-
         self._fallback_translate()
 
     def _try_gemini(self):
-        """
-        Call Gemini with a hard 8-second timeout using concurrent.futures.
-        Returns a result dict on success, None on timeout or any failure.
-        """
-
-
+        import concurrent.futures
         def _call():
             client = genai.Client(api_key=GEMINI_API_KEY)
-
+            ctx = ""
             if self.context_sentence and self.context_sentence.strip() != self.text.strip():
-                context_block = (
-                    f'The word appears in this German sentence:\n'
-                    f'"{self.context_sentence}"\n\n'
-                    f'Use the sentence to determine the correct meaning in context.\n\n'
-                )
-            else:
-                context_block = ""
-
-            prompt = (
-                "You are a German language tutor.\n"
-                "Return ONLY a valid raw JSON object — no markdown, no backticks.\n\n"
-                "Fields:\n"
-                "  word        — the word as given\n"
-                "  pos         — grammar label e.g. 'noun (der)', 'verb', 'adjective'\n"
-                "  meaning     — concise English explanation in context; include der/die/das for nouns\n"
-                "  example_de  — the context sentence if provided, otherwise a natural German example\n"
-                "  example_en  — English translation of example_de\n\n"
-                + context_block +
-                f"German word to look up: {self.text}"
-            )
-
+                ctx = (f'\nThe word appears in this sentence: "{self.context_sentence}"\n'
+                       f'Use this context for context_meaning.\n')
+            prompt = GEMINI_PROMPT + ctx + f"\nGerman word: {self.text}"
             response = client.models.generate_content(
                 model="gemma-4-26b-a4b-it",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     thinking_config=types.ThinkingConfig(
-                        thinking_level="minimal",
-                        include_thoughts=False
+                        thinking_level="minimal", include_thoughts=False
                     )
                 )
             )
-            # return response.text.strip()
-
-            parts = []
-            for part in response.candidates[0].content.parts:
-                if getattr(part, "thought", False):
-                    continue
-
-                if getattr(part, "text", None):
-                    parts.append(part.text)
-
-            raw = "\n".join(parts).strip()
-            
-            return raw
+            parts = [p.text for p in response.candidates[0].content.parts
+                     if not getattr(p, "thought", False) and getattr(p, "text", None)]
+            return "\n".join(parts).strip()
 
         try:
-            # with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            #     future = ex.submit(_call)
-            #     try:
-            #         raw = future.result(timeout=8)   # give up after 8 s
-            #     except concurrent.futures.TimeoutError:
-            #         return None   # → fallback to deep-translator
-
-            # executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-
-            # future = executor.submit(_call)
-
-            # try:
-            #     raw = future.result(timeout=8)
-            # except concurrent.futures.TimeoutError:
-            #     future.cancel()
-            #     executor.shutdown(wait=False)
-            #     return None
-            # finally:
-            #     executor.shutdown(wait=False)
-
-            raw = _call()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(_call)
+                try:
+                    raw = future.result(timeout=15)
+                except concurrent.futures.TimeoutError:
+                    return None
 
             raw = re.sub(r"^```[a-z]*\n?", "", raw)
             raw = re.sub(r"\n?```$", "", raw)
-
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-
-            if not match:
-                raise Exception("Gemini returned no JSON")
-
-            data = json.loads(match.group(0))
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            if not m:
+                return None
+            data = json.loads(m.group(0))
             data["is_phrase"] = False
             data["source"]    = "Gemini"
             return data
-
         except Exception as e:
             print("Gemini error:", e)
             return None
@@ -232,101 +246,78 @@ class LookupWorker(QThread):
         try:
             translation = GoogleTranslator(source="de", target="en").translate(self.text)
             self.result_ready.emit({
-                "word":       self.text,
-                "pos":        "translation",
-                "meaning":    translation,
+                "word": self.text, "is_phrase": False,
+                "part_of_speech": "translation",
+                "context_meaning": translation,
                 "example_de": self.context_sentence or "",
-                "example_en": "",
-                "is_phrase":  False,
-                "source":     "Google Translate",
+                "source": "Google Translate",
             })
         except Exception as e:
             self.error.emit(f"Lookup failed: {e}")
 
 
 # ─────────────────────────────────────────────
-#  Clickable text browser
+#  Helpers for rich display
 # ─────────────────────────────────────────────
-class GermanTextBrowser(QTextBrowser):
-    # word/phrase text, context sentence, is_phrase
-    text_selected = pyqtSignal(str, str, bool)
+SECTION_STYLE = """
+    QFrame#section {
+        border: 1px solid #E0E0EC;
+        border-radius: 6px;
+        background: #FAFAFA;
+    }
+"""
 
-    def __init__(self):
-        super().__init__()
-        self.setReadOnly(True)
-        self.setOpenLinks(False)
-        self.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse |
-            Qt.TextInteractionFlag.TextSelectableByKeyboard
-        )
-        self.viewport().setCursor(QCursor(Qt.CursorShape.IBeamCursor))
-        self.setStyleSheet(
-            "QTextBrowser { color: #1A1A1A; background-color: #FFFFFF; }"
-        )
+def make_section(title, content_widget, accent="#7F77DD"):
+    """Return a framed section widget with a title bar."""
+    frame = QFrame()
+    frame.setObjectName("section")
+    frame.setStyleSheet(SECTION_STYLE)
+    vlay = QVBoxLayout(frame)
+    vlay.setContentsMargins(0, 0, 0, 0)
+    vlay.setSpacing(0)
 
-    def mouseReleaseEvent(self, e):
-        super().mouseReleaseEvent(e)
-        if e.button() != Qt.MouseButton.LeftButton:
-            return
+    title_bar = QLabel(f"  {title}")
+    title_bar.setStyleSheet(
+        f"background: {accent}22; color: {accent}; font-size: 10px; font-weight: bold; "
+        f"padding: 3px 6px; border-radius: 5px 5px 0 0;"
+    )
+    vlay.addWidget(title_bar)
+    vlay.addWidget(content_widget)
+    return frame
 
-        cursor = self.textCursor()
-        selected = cursor.selectedText().strip()
+def pill_label(text, bg="#7F77DD", fg="#FFFFFF"):
+    lbl = QLabel(text)
+    lbl.setStyleSheet(
+        f"background: {bg}; color: {fg}; border-radius: 8px; "
+        f"padding: 2px 10px; font-size: 11px;"
+    )
+    lbl.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+    return lbl
 
-        # ── Multi-word selection → phrase translation ──────────────────────
-        if selected and len(selected.split()) > 1:
-            selected = selected.replace("\u2029", " ").replace("\u2028", " ")
-            selected = re.sub(r"\s+", " ", selected).strip()
-            if re.search(r"[a-zA-ZäöüÄÖÜß]", selected):
-                self._apply_highlight(cursor)
-                # For phrases the phrase itself is the context
-                self.text_selected.emit(selected, selected, True)
-            return
+def body_label(text, color="#1A1A1A", size=11, bold=False):
+    lbl = QLabel(text)
+    lbl.setWordWrap(True)
+    w = QFont.Weight.Bold if bold else QFont.Weight.Normal
+    lbl.setFont(QFont("", size, w))
+    lbl.setStyleSheet(f"color: {color}; padding: 2px 8px;")
+    return lbl
 
-        # ── Single word click → contextual lookup ─────────────────────────
-        wc = self.cursorForPosition(e.pos())
-        wc.select(QTextCursor.SelectionType.WordUnderCursor)
-        word = wc.selectedText().strip()
-        word = re.sub(r"[^\w\-äöüÄÖÜß]", "", word, flags=re.UNICODE)
-        if not word or not re.search(r"[a-zA-ZäöüÄÖÜß]", word):
-            return
-
-        # Extract the sentence the word lives in
-        context = self._extract_sentence(wc)
-        self._apply_highlight(wc)
-        self.text_selected.emit(word, context, False)
-
-    def _extract_sentence(self, cursor):
-        """Return the sentence (or paragraph line) containing the cursor."""
-        # Get the block (paragraph) text — fast and reliable
-        block_text = cursor.block().text().strip()
-        if not block_text:
-            return ""
-
-        # Split block into sentences and return the one containing the word
-        pos_in_block = cursor.positionInBlock()
-        sentences = re.split(r"(?<=[.!?])\s+", block_text)
-        char_count = 0
-        for sent in sentences:
-            char_count += len(sent) + 1   # +1 for the space/punctuation consumed
-            if char_count >= pos_in_block:
-                return sent.strip()
-        return block_text   # fallback: whole block
-
-    def _apply_highlight(self, cursor):
-        full = QTextCursor(self.document())
-        full.select(QTextCursor.SelectionType.Document)
-        full.setCharFormat(QTextCharFormat())        # clear all
-        fmt = QTextCharFormat()
-        fmt.setBackground(QColor("#BFD7F5"))
-        fmt.setForeground(QColor("#0A3060"))
-        cursor.setCharFormat(fmt)
-
-    def load_german_text(self, text):
-        self.setPlainText(text)
+def list_widget(items, bullet="•", color="#333333"):
+    """Widget showing a bulleted list of strings."""
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(8, 4, 8, 4)
+    lay.setSpacing(2)
+    for item in items:
+        lbl = QLabel(f"{bullet} {item}")
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet(f"color: {color}; font-size: 11px;")
+        lay.addWidget(lbl)
+    return w
 
 
 # ─────────────────────────────────────────────
-#  Lookup Panel
+#  Lookup Panel (rich, scrollable)
 # ─────────────────────────────────────────────
 class LookupPanel(QFrame):
     save_requested = pyqtSignal(dict)
@@ -338,124 +329,109 @@ class LookupPanel(QFrame):
 
     def _setup_ui(self):
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(5)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
-        # Header row: "Word Lookup" + source badge
-        header_row = QHBoxLayout()
+        # ── Top bar ──────────────────────────────
+        top = QFrame()
+        top.setStyleSheet("background: #F0F0F8; border-bottom: 1px solid #E0E0EC;")
+        top_lay = QHBoxLayout(top)
+        top_lay.setContentsMargins(10, 8, 10, 8)
+
         lbl = QLabel("Word Lookup")
         lbl.setFont(QFont("", 10, QFont.Weight.Bold))
-        lbl.setStyleSheet("color: #1A1A1A;")
-        header_row.addWidget(lbl)
-        header_row.addStretch()
+        lbl.setStyleSheet("color: #1A1A1A; background: transparent;")
+        top_lay.addWidget(lbl)
+        top_lay.addStretch()
+
         self.source_badge = QLabel("")
-        self.source_badge.setStyleSheet(
-            "color: #FFFFFF; background: #7F77DD; border-radius: 8px; "
-            "padding: 1px 8px; font-size: 10px;"
-        )
         self.source_badge.setVisible(False)
-        header_row.addWidget(self.source_badge)
-        layout.addLayout(header_row)
+        top_lay.addWidget(self.source_badge)
+        outer.addWidget(top)
 
-        self.word_label = QLabel("Click any word in the text above")
-        self.word_label.setFont(QFont("", 15, QFont.Weight.Bold))
-        self.word_label.setWordWrap(True)
-        self.word_label.setStyleSheet("color: #1A1A1A;")
-        layout.addWidget(self.word_label)
+        # ── Scroll area for rich content ─────────
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
-        self.pos_label = QLabel("")
-        self.pos_label.setStyleSheet("color: #666666; font-size: 11px;")
-        layout.addWidget(self.pos_label)
+        self.content = QWidget()
+        self.content_lay = QVBoxLayout(self.content)
+        self.content_lay.setContentsMargins(8, 8, 8, 8)
+        self.content_lay.setSpacing(6)
+        self.content_lay.addStretch()
+        scroll.setWidget(self.content)
+        outer.addWidget(scroll, 1)
 
-        self.meaning_label = QLabel("")
-        self.meaning_label.setWordWrap(True)
-        self.meaning_label.setFont(QFont("", 12))
-        self.meaning_label.setStyleSheet("color: #1A1A1A;")
-        layout.addWidget(self.meaning_label)
-
-        # Example / context box
-        self.example_frame = QFrame()
-        self.example_frame.setStyleSheet(
-            "QFrame { border-left: 3px solid #7F77DD; background: #F4F4FB; "
-            "border-radius: 0 6px 6px 0; }"
-        )
-        ex_layout = QVBoxLayout(self.example_frame)
-        ex_layout.setContentsMargins(10, 6, 8, 6)
-        ex_layout.setSpacing(2)
-        self.ex_header = QLabel("Example")
-        self.ex_header.setStyleSheet("color: #888888; font-size: 10px;")
-        self.example_de = QLabel("")
-        self.example_de.setWordWrap(True)
-        self.example_de.setFont(QFont("", 11, QFont.Weight.Bold))
-        self.example_de.setStyleSheet("color: #1A1A1A;")
-        self.example_en = QLabel("")
-        self.example_en.setWordWrap(True)
-        self.example_en.setStyleSheet("color: #444444; font-size: 11px;")
-        ex_layout.addWidget(self.ex_header)
-        ex_layout.addWidget(self.example_de)
-        ex_layout.addWidget(self.example_en)
-        layout.addWidget(self.example_frame)
-        self.example_frame.setVisible(False)
-
+        # ── Save button ───────────────────────────
+        bottom = QFrame()
+        bottom.setStyleSheet("border-top: 1px solid #E0E0EC;")
+        bot_lay = QHBoxLayout(bottom)
+        bot_lay.setContentsMargins(10, 6, 10, 6)
         self.save_btn = QPushButton("+ Save to Vocabulary")
         self.save_btn.setEnabled(False)
-        self.save_btn.clicked.connect(self._on_save)
         self.save_btn.setFixedHeight(30)
-        layout.addWidget(self.save_btn)
-        layout.addStretch()
+        self.save_btn.clicked.connect(self._on_save)
+        bot_lay.addWidget(self.save_btn)
+        outer.addWidget(bottom)
+
+        # placeholder
+        self._set_placeholder()
+
+    def _clear_content(self):
+        while self.content_lay.count():
+            item = self.content_lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+    def _set_placeholder(self):
+        self._clear_content()
+        ph = QLabel("Click any word in the text\nto see a full breakdown")
+        ph.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ph.setStyleSheet("color: #AAAAAA; font-size: 12px;")
+        self.content_lay.addStretch()
+        self.content_lay.addWidget(ph)
+        self.content_lay.addStretch()
 
     def show_loading(self, text, is_phrase=False):
         self.current_data = None
-        display = text if len(text) <= 44 else text[:42] + "…"
-        self.word_label.setText(display)
-        self.pos_label.setText("translating…" if is_phrase else "looking up…")
-        self.meaning_label.setText("")
-        self.example_frame.setVisible(False)
+        self._clear_content()
         self.source_badge.setVisible(False)
         self.save_btn.setEnabled(False)
         self.save_btn.setText("+ Save to Vocabulary")
 
+        verb = "Translating" if is_phrase else "Looking up"
+        ph = QLabel(f'{verb}  "{text}"…')
+        ph.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ph.setStyleSheet("color: #888888; font-size: 12px;")
+        self.content_lay.addStretch()
+        self.content_lay.addWidget(ph)
+        self.content_lay.addStretch()
+
     def show_result(self, data, already_saved):
         self.current_data = data
+        self._clear_content()
+
         is_phrase = data.get("is_phrase", False)
         source    = data.get("source", "")
         word      = data.get("word", "")
-
-        display = word if len(word) <= 44 else word[:42] + "…"
-        self.word_label.setText(display)
 
         # Source badge
         if source:
             color = "#5B8DD9" if source == "Google Translate" else "#7F77DD"
             self.source_badge.setStyleSheet(
-                f"color: #FFFFFF; background: {color}; border-radius: 8px; "
-                "padding: 1px 8px; font-size: 10px;"
+                f"color:#FFF;background:{color};border-radius:8px;padding:2px 10px;font-size:10px;"
             )
             self.source_badge.setText(f"via {source}")
             self.source_badge.setVisible(True)
-        else:
-            self.source_badge.setVisible(False)
 
         if is_phrase:
-            self.pos_label.setText("phrase translation")
-            self.meaning_label.setText(data.get("meaning", ""))
-            self.ex_header.setText("Selected text")
-            self.example_de.setText(word)
-            self.example_en.setText(data.get("meaning", ""))
-            self.example_frame.setVisible(True)
+            self._render_phrase(data)
         else:
-            self.pos_label.setText(data.get("pos", ""))
-            self.meaning_label.setText(data.get("meaning", ""))
-            ex_de = data.get("example_de", "")
-            ex_en = data.get("example_en", "")
-            if ex_de:
-                self.ex_header.setText("Context / example")
-                self.example_de.setText(ex_de)
-                self.example_en.setText(ex_en)
-                self.example_frame.setVisible(True)
-            else:
-                self.example_frame.setVisible(False)
+            self._render_word(data)
+
+        self.content_lay.addStretch()
 
         if already_saved:
             self.save_btn.setText("✓ Already saved")
@@ -464,13 +440,183 @@ class LookupPanel(QFrame):
             self.save_btn.setText("+ Save phrase" if is_phrase else "+ Save to Vocabulary")
             self.save_btn.setEnabled(True)
 
+    def _render_phrase(self, d):
+        lay = self.content_lay
+        word  = d.get("word", "")
+        trans = d.get("context_meaning", "")
+
+        title = QLabel(word[:60] + ("…" if len(word) > 60 else ""))
+        title.setFont(QFont("", 14, QFont.Weight.Bold))
+        title.setWordWrap(True)
+        title.setStyleSheet("color:#1A1A1A;")
+        lay.addWidget(title)
+
+        sub = QLabel("Phrase translation")
+        sub.setStyleSheet("color:#888;font-size:10px;")
+        lay.addWidget(sub)
+
+        box = QWidget()
+        bl = QVBoxLayout(box)
+        bl.setContentsMargins(8,6,8,6)
+        bl.addWidget(body_label(trans, color="#1A1A1A", size=12))
+        lay.addWidget(make_section("Translation", box, "#5B8DD9"))
+
+    def _render_word(self, d):
+        lay = self.content_lay
+
+        # ── Word + meta row ──────────────────────
+        word = d.get("word", "")
+        lemma = d.get("lemma", "")
+        pos   = d.get("part_of_speech", "")
+        cefr  = d.get("cefr_level", "")
+        pron  = d.get("pronunciation", "")
+        gender= d.get("gender","")
+        plural= d.get("plural","")
+
+        title = QLabel(word)
+        title.setFont(QFont("", 17, QFont.Weight.Bold))
+        title.setStyleSheet("color:#1A1A1A;")
+        lay.addWidget(title)
+
+        if lemma and lemma.lower() != word.lower():
+            sub = QLabel(f"Base form: {lemma}")
+            sub.setStyleSheet("color:#888;font-size:10px;")
+            lay.addWidget(sub)
+
+        # Pills row
+        pills = QHBoxLayout()
+        pills.setSpacing(4)
+        pills.setContentsMargins(0,0,0,0)
+        if pos:   pills.addWidget(pill_label(pos, "#555577", "#FFFFFF"))
+        if cefr:  pills.addWidget(pill_label(cefr, "#3A9A5C", "#FFFFFF"))
+        if gender:pills.addWidget(pill_label(gender, "#C0652B", "#FFFFFF"))
+        if pron:  pills.addWidget(pill_label(pron, "#888888", "#FFFFFF"))
+        pills.addStretch()
+        pw = QWidget(); pw.setLayout(pills)
+        lay.addWidget(pw)
+
+        if plural:
+            pl = QLabel(f"Plural: {plural}")
+            pl.setStyleSheet("color:#555;font-size:11px;")
+            lay.addWidget(pl)
+
+        # ── Context meaning ──────────────────────
+        ctx = d.get("context_meaning","")
+        if ctx:
+            box = QWidget(); bl = QVBoxLayout(box)
+            bl.setContentsMargins(8,6,8,6)
+            bl.addWidget(body_label(ctx, color="#1A1A1A", size=13, bold=True))
+            lay.addWidget(make_section("Meaning in context", box, "#3A9A5C"))
+
+        # ── Other meanings ───────────────────────
+        others = d.get("other_meanings", [])
+        if others and isinstance(others, list) and len(others) > 0:
+            box = list_widget(others)
+            lay.addWidget(make_section("Other meanings", box, "#7F77DD"))
+
+        # ── Example ──────────────────────────────
+        ex_de = d.get("example_de","")
+        ex_en = d.get("example_en","")
+        if ex_de:
+            box = QWidget(); bl = QVBoxLayout(box)
+            bl.setContentsMargins(8,6,8,6); bl.setSpacing(2)
+            bl.addWidget(body_label(ex_de, color="#1A1A1A", size=11, bold=True))
+            if ex_en: bl.addWidget(body_label(ex_en, color="#555555", size=10))
+            lay.addWidget(make_section("Example / Context sentence", box, "#5B8DD9"))
+
+        # ── Grammar ──────────────────────────────
+        conj   = d.get("conjugation") or {}
+        comp   = d.get("comparison") or {}
+        gnotes = d.get("grammar_notes","")
+
+        if conj and isinstance(conj, dict) and any(conj.get(k) for k in ["ich","du","er"]):
+            box = QWidget(); bl = QVBoxLayout(box)
+            bl.setContentsMargins(8,6,8,6); bl.setSpacing(2)
+            pairs = [("ich",conj.get("ich","")),("du",conj.get("du","")),
+                     ("er/sie/es",conj.get("er","")),("wir",conj.get("wir","")),
+                     ("ihr",conj.get("ihr","")),("sie",conj.get("sie",""))]
+            for pronoun, form in pairs:
+                if form:
+                    row = QHBoxLayout()
+                    row.setContentsMargins(0,0,0,0)
+                    pl = QLabel(pronoun); pl.setFixedWidth(70)
+                    pl.setStyleSheet("color:#888;font-size:11px;")
+                    fl = QLabel(form)
+                    fl.setStyleSheet("color:#1A1A1A;font-size:11px;font-weight:bold;")
+                    row.addWidget(pl); row.addWidget(fl); row.addStretch()
+                    rw = QWidget(); rw.setLayout(row)
+                    bl.addWidget(rw)
+            for k,label in [("past","Past (Präteritum)"),("perfect","Perfect (Perfekt)")]:
+                if conj.get(k):
+                    bl.addWidget(body_label(f"{label}: {conj[k]}", color="#555", size=10))
+            sep = conj.get("separable")
+            if sep is not None:
+                bl.addWidget(body_label(f"Separable: {'Yes' if sep else 'No'}", color="#888", size=10))
+            lay.addWidget(make_section("Conjugation", box, "#C0652B"))
+
+        if comp and isinstance(comp, dict) and any(comp.values()):
+            box = QWidget(); bl = QVBoxLayout(box)
+            bl.setContentsMargins(8,6,8,6); bl.setSpacing(2)
+            if comp.get("comparative"):
+                bl.addWidget(body_label(f"Comparative: {comp['comparative']}", size=11))
+            if comp.get("superlative"):
+                bl.addWidget(body_label(f"Superlative: {comp['superlative']}", size=11))
+            lay.addWidget(make_section("Comparison", box, "#C0652B"))
+
+        if gnotes:
+            box = QWidget(); bl = QVBoxLayout(box)
+            bl.setContentsMargins(8,6,8,6)
+            bl.addWidget(body_label(gnotes, color="#333", size=11))
+            lay.addWidget(make_section("Grammar notes", box, "#C0652B"))
+
+        # ── Synonyms / Antonyms ──────────────────
+        syns = d.get("synonyms",[]) or []
+        ants = d.get("antonyms",[]) or []
+        if syns or ants:
+            box = QWidget(); bl = QVBoxLayout(box)
+            bl.setContentsMargins(8,4,8,4); bl.setSpacing(2)
+            if syns: bl.addWidget(body_label("Synonyms: " + ", ".join(syns), size=11))
+            if ants: bl.addWidget(body_label("Antonyms: " + ", ".join(ants), size=11, color="#C0652B"))
+            lay.addWidget(make_section("Synonyms & Antonyms", box, "#888888"))
+
+        # ── Word family ──────────────────────────
+        wf = d.get("word_family",[]) or []
+        if wf:
+            lay.addWidget(make_section("Word family", list_widget(wf, "🔗", "#333"), "#3A9A5C"))
+
+        # ── Collocations ─────────────────────────
+        coll = d.get("collocations",[]) or []
+        if coll:
+            lay.addWidget(make_section("Common collocations", list_widget(coll, "❤️", "#333"), "#E05588"))
+
+        # ── Common phrases ───────────────────────
+        phrases = d.get("common_phrases",[]) or []
+        if phrases:
+            lay.addWidget(make_section("Common phrases", list_widget(phrases, "💬", "#333"), "#5B8DD9"))
+
+        # ── Common mistakes ──────────────────────
+        mistakes = d.get("common_mistakes",[]) or []
+        if mistakes:
+            lay.addWidget(make_section("Common mistakes", list_widget(mistakes, "⚠️", "#C0652B"), "#C0652B"))
+
+        # ── Memory tip ───────────────────────────
+        tip = d.get("memory_tip","")
+        if tip:
+            box = QWidget(); bl = QVBoxLayout(box)
+            bl.setContentsMargins(8,6,8,6)
+            bl.addWidget(body_label(f"💡 {tip}", color="#5B4A00", size=11))
+            box.setStyleSheet("background:#FFFBEA;")
+            lay.addWidget(make_section("Memory tip", box, "#D4A000"))
+
     def show_error(self, msg):
-        self.word_label.setText("Error")
-        self.pos_label.setText("")
-        self.meaning_label.setText(msg)
-        self.example_frame.setVisible(False)
+        self._clear_content()
         self.source_badge.setVisible(False)
         self.save_btn.setEnabled(False)
+        err = QLabel(f"Error: {msg}")
+        err.setStyleSheet("color:#CC3333;padding:10px;")
+        err.setWordWrap(True)
+        self.content_lay.addWidget(err)
+        self.content_lay.addStretch()
 
     def mark_saved(self):
         self.save_btn.setText("✓ Saved!")
@@ -482,12 +628,76 @@ class LookupPanel(QFrame):
 
 
 # ─────────────────────────────────────────────
+#  Clickable text browser
+# ─────────────────────────────────────────────
+class GermanTextBrowser(QTextBrowser):
+    text_selected = pyqtSignal(str, str, bool)
+
+    def __init__(self):
+        super().__init__()
+        self.setReadOnly(True)
+        self.setOpenLinks(False)
+        self.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse |
+            Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        self.viewport().setCursor(QCursor(Qt.CursorShape.IBeamCursor))
+        self.setStyleSheet("QTextBrowser{color:#1A1A1A;background:#FFFFFF;}")
+
+    def mouseReleaseEvent(self, e):
+        super().mouseReleaseEvent(e)
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        cursor = self.textCursor()
+        selected = cursor.selectedText().strip()
+        if selected and len(selected.split()) > 1:
+            selected = re.sub(r"[\u2029\u2028]", " ", selected)
+            selected = re.sub(r"\s+", " ", selected).strip()
+            if re.search(r"[a-zA-ZäöüÄÖÜß]", selected):
+                self._apply_highlight(cursor)
+                self.text_selected.emit(selected, selected, True)
+            return
+        wc = self.cursorForPosition(e.pos())
+        wc.select(QTextCursor.SelectionType.WordUnderCursor)
+        word = re.sub(r"[^\w\-äöüÄÖÜß]", "", wc.selectedText().strip(), flags=re.UNICODE)
+        if word and re.search(r"[a-zA-ZäöüÄÖÜß]", word):
+            context = self._extract_sentence(wc)
+            self._apply_highlight(wc)
+            self.text_selected.emit(word, context, False)
+
+    def _extract_sentence(self, cursor):
+        block_text = cursor.block().text().strip()
+        if not block_text:
+            return ""
+        pos = cursor.positionInBlock()
+        sentences = re.split(r"(?<=[.!?])\s+", block_text)
+        count = 0
+        for s in sentences:
+            count += len(s) + 1
+            if count >= pos:
+                return s.strip()
+        return block_text
+
+    def _apply_highlight(self, cursor):
+        full = QTextCursor(self.document())
+        full.select(QTextCursor.SelectionType.Document)
+        full.setCharFormat(QTextCharFormat())
+        fmt = QTextCharFormat()
+        fmt.setBackground(QColor("#BFD7F5"))
+        fmt.setForeground(QColor("#0A3060"))
+        cursor.setCharFormat(fmt)
+
+    def load_german_text(self, text):
+        self.setPlainText(text)
+
+
+# ─────────────────────────────────────────────
 #  Vocabulary Panel
 # ─────────────────────────────────────────────
 class VocabPanel(QFrame):
     def __init__(self, db: VocabDB):
         super().__init__()
-        self.db       = db
+        self.db = db
         self._all_rows = []
         self._setup_ui()
         self.refresh()
@@ -495,33 +705,34 @@ class VocabPanel(QFrame):
     def _setup_ui(self):
         self.setFrameShape(QFrame.Shape.StyledPanel)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setContentsMargins(10,10,10,10)
         layout.setSpacing(6)
 
-        header = QHBoxLayout()
+        hdr = QHBoxLayout()
         lbl = QLabel("Saved Vocabulary")
         lbl.setFont(QFont("", 10, QFont.Weight.Bold))
-        lbl.setStyleSheet("color: #1A1A1A;")
-        header.addWidget(lbl)
-        header.addStretch()
+        lbl.setStyleSheet("color:#1A1A1A;")
+        hdr.addWidget(lbl)
+        hdr.addStretch()
         self.count_label = QLabel("0 words")
-        self.count_label.setStyleSheet("color: #666666; font-size: 11px;")
-        header.addWidget(self.count_label)
-        layout.addLayout(header)
+        self.count_label.setStyleSheet("color:#666;font-size:11px;")
+        hdr.addWidget(self.count_label)
+        layout.addLayout(hdr)
 
         self.search = QLineEdit()
         self.search.setPlaceholderText("Filter…")
         self.search.setFixedHeight(28)
-        self.search.setStyleSheet("color: #1A1A1A; background: #FFFFFF;")
+        self.search.setStyleSheet("color:#1A1A1A;background:#FFFFFF;")
         self.search.textChanged.connect(self.filter_words)
         layout.addWidget(self.search)
 
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Word", "Meaning", ""])
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Word", "POS", "Meaning", ""])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(2, 28)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(3, 28)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -529,18 +740,20 @@ class VocabPanel(QFrame):
         self.table.setShowGrid(False)
         self.table.setFont(QFont("", 11))
         self.table.setStyleSheet("""
-            QTableWidget            { color: #1A1A1A; background: #FFFFFF; }
-            QTableWidget::item      { color: #1A1A1A; }
-            QTableWidget::item:alternate { background: #F3F3F8; color: #1A1A1A; }
-            QTableWidget::item:selected  { background: #BFD7F5; color: #0A3060; }
-            QHeaderView::section    { color: #1A1A1A; background: #ECECEC; }
+            QTableWidget { color:#1A1A1A; background:#FFFFFF; }
+            QTableWidget::item { color:#1A1A1A; }
+            QTableWidget::item:alternate { background:#F3F3F8; color:#1A1A1A; }
+            QTableWidget::item:selected  { background:#BFD7F5; color:#0A3060; }
+            QHeaderView::section { color:#1A1A1A; background:#ECECEC; }
         """)
         layout.addWidget(self.table)
 
-        export_btn = QPushButton("Export to CSV")
+        btn_row = QHBoxLayout()
+        export_btn = QPushButton("Export CSV")
         export_btn.setFixedHeight(28)
         export_btn.clicked.connect(self.export_csv)
-        layout.addWidget(export_btn)
+        btn_row.addWidget(export_btn)
+        layout.addLayout(btn_row)
 
     def refresh(self):
         self._all_rows = self.db.all_words()
@@ -548,7 +761,9 @@ class VocabPanel(QFrame):
 
     def _render(self, rows):
         self.table.setRowCount(0)
-        for row_id, word, pos, meaning, ex_de, ex_en in rows:
+        # rows: id, word, part_of_speech, context_meaning, cefr_level, example_de, example_en
+        for row in rows:
+            row_id, word, pos, meaning, cefr, ex_de, ex_en = row
             r = self.table.rowCount()
             self.table.insertRow(r)
 
@@ -558,28 +773,35 @@ class VocabPanel(QFrame):
             w_item.setData(Qt.ItemDataRole.UserRole, row_id)
             self.table.setItem(r, 0, w_item)
 
-            short  = (meaning or "").split(".")[0] + "."
+            p_item = QTableWidgetItem(pos or "")
+            p_item.setForeground(QColor("#666666"))
+            p_item.setFont(QFont("", 10))
+            self.table.setItem(r, 1, p_item)
+
+            short = (meaning or "").split(".")[0] + "."
             m_item = QTableWidgetItem(short)
             m_item.setForeground(QColor("#333333"))
             m_item.setToolTip(f"{meaning}\n\n{ex_de}\n{ex_en}")
-            self.table.setItem(r, 1, m_item)
+            self.table.setItem(r, 2, m_item)
+
+            if cefr:
+                cefr_item = QTableWidgetItem(cefr)
+                cefr_item.setForeground(QColor("#3A9A5C"))
+                cefr_item.setFont(QFont("", 10, QFont.Weight.Bold))
+                self.table.setItem(r, 2, m_item)   # keep meaning in col 2
 
             del_btn = QPushButton("×")
             del_btn.setFixedSize(QSize(24, 24))
-            del_btn.setStyleSheet(
-                "color: #cc3333; font-weight: bold; border: none; background: transparent;"
-            )
+            del_btn.setStyleSheet("color:#cc3333;font-weight:bold;border:none;background:transparent;")
             del_btn.clicked.connect(lambda _, rid=row_id: self._delete(rid))
-            self.table.setCellWidget(r, 2, del_btn)
+            self.table.setCellWidget(r, 3, del_btn)
 
-        self.count_label.setText(f"{len(rows)} word{'s' if len(rows) != 1 else ''}")
+        self.count_label.setText(f"{len(rows)} word{'s' if len(rows)!=1 else ''}")
 
     def filter_words(self, text):
-        filtered = [
-            r for r in self._all_rows
-            if text.lower() in (r[1] or "").lower()
-            or text.lower() in (r[3] or "").lower()
-        ]
+        t = text.lower()
+        filtered = [r for r in self._all_rows
+                    if t in (r[1] or "").lower() or t in (r[3] or "").lower()]
         self._render(filtered)
 
     def _delete(self, row_id):
@@ -587,15 +809,13 @@ class VocabPanel(QFrame):
         self.refresh()
 
     def export_csv(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export Vocabulary", "vocab.csv", "CSV files (*.csv)"
-        )
+        path, _ = QFileDialog.getSaveFileName(self, "Export Vocabulary", "vocab.csv", "CSV files (*.csv)")
         if path:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
-                w.writerow(["Word", "Part of Speech", "Meaning", "Example (DE)", "Example (EN)"])
-                for row_id, word, pos, meaning, ex_de, ex_en in self.db.all_words():
-                    w.writerow([word, pos, meaning, ex_de, ex_en])
+                w.writerow(["Word","POS","Meaning","CEFR","Example (DE)","Example (EN)"])
+                for row in self.db.all_words():
+                    w.writerow(row[1:])
             QMessageBox.information(self, "Exported", f"Saved to {path}")
 
 
@@ -608,30 +828,30 @@ class MainWindow(QMainWindow):
         self.db     = VocabDB()
         self.worker = None
         self.setWindowTitle("German Learning Assistant")
-        self.resize(1100, 680)
+        self.resize(1200, 720)
         self._build_ui()
 
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(10, 8, 10, 8)
+        root.setContentsMargins(10,8,10,8)
         root.setSpacing(6)
 
         main_split = QSplitter(Qt.Orientation.Horizontal)
         left_split = QSplitter(Qt.Orientation.Vertical)
 
-        # ── Text input / reader ───────────────────────────────────────────
+        # ── Text input / reader ──────────────────
         input_frame = QFrame()
         input_frame.setFrameShape(QFrame.Shape.StyledPanel)
         in_layout = QVBoxLayout(input_frame)
-        in_layout.setContentsMargins(10, 10, 10, 8)
+        in_layout.setContentsMargins(10,10,10,8)
         in_layout.setSpacing(6)
 
         hdr = QHBoxLayout()
         lbl = QLabel("German Text")
         lbl.setFont(QFont("", 10, QFont.Weight.Bold))
-        lbl.setStyleSheet("color: #1A1A1A;")
+        lbl.setStyleSheet("color:#1A1A1A;")
         hdr.addWidget(lbl)
         hdr.addStretch()
         self.load_btn = QPushButton("Load →")
@@ -648,12 +868,10 @@ class MainWindow(QMainWindow):
         self.editor = QTextEdit()
         self.editor.setPlaceholderText(
             "Paste your German text here, then click 'Load →'\n\n"
-            "Example:\nDas Buch liegt auf dem Tisch. Die Sonne scheint hell."
+            "Example:\nHallo meine liebe kleiner."
         )
         self.editor.setFont(QFont("", 13))
-        self.editor.setStyleSheet(
-            "QTextEdit { color: #1A1A1A; background-color: #FFFFFF; }"
-        )
+        self.editor.setStyleSheet("QTextEdit{color:#1A1A1A;background:#FFFFFF;}")
         in_layout.addWidget(self.editor)
 
         self.reader = GermanTextBrowser()
@@ -664,39 +882,30 @@ class MainWindow(QMainWindow):
 
         left_split.addWidget(input_frame)
 
-        # ── Lookup panel ─────────────────────────────────────────────────
         self.lookup = LookupPanel()
         self.lookup.save_requested.connect(self._on_save)
         left_split.addWidget(self.lookup)
+        left_split.setSizes([300, 380])
 
-        left_split.setSizes([320, 220])
         main_split.addWidget(left_split)
-
-        # ── Vocab panel ──────────────────────────────────────────────────
         self.vocab_panel = VocabPanel(self.db)
         main_split.addWidget(self.vocab_panel)
-
-        main_split.setSizes([700, 380])
+        main_split.setSizes([750, 420])
         root.addWidget(main_split)
 
-        # Status bar
         self.status = QLabel("Ready — paste German text and click 'Load →'")
-        self.status.setStyleSheet("font-size: 11px; color: #555555; padding: 2px 4px;")
+        self.status.setStyleSheet("font-size:11px;color:#555;padding:2px 4px;")
         root.addWidget(self.status)
 
     def _switch_to_reader(self):
         text = self.editor.toPlainText().strip()
-        if not text:
-            return
+        if not text: return
         self.reader.load_german_text(text)
         self.editor.setVisible(False)
         self.reader.setVisible(True)
         self.load_btn.setVisible(False)
         self.edit_btn.setVisible(True)
-        self.status.setText(
-            "Click a word to look it up in context  |  "
-            "Drag to select multiple words for phrase translation"
-        )
+        self.status.setText("Click a word for full breakdown  |  Drag to select a phrase")
 
     def _switch_to_editor(self):
         self.editor.setVisible(True)
@@ -705,45 +914,31 @@ class MainWindow(QMainWindow):
         self.edit_btn.setVisible(False)
 
     def _on_text_selected(self, text, context, is_phrase):
-        if is_phrase:
-            self.status.setText(f"Translating phrase…")
-        else:
-            self.status.setText(f"Looking up '{text}' in context…")
+        self.status.setText("Translating…" if is_phrase else f"Looking up '{text}'…")
         self.lookup.show_loading(text, is_phrase)
-
         if self.worker and self.worker.isRunning():
-            print("Lookup already running")
+            print("Worker busy, skipping")
             return
-
         self.worker = LookupWorker(text, context, is_phrase)
         self.worker.result_ready.connect(self._on_lookup_result)
         self.worker.error.connect(self._on_lookup_error)
         self.worker.start()
 
     def _on_lookup_result(self, data):
-        already = self.db.exists(data.get("word", ""))
+        already = self.db.exists(data.get("word",""))
         self.lookup.show_result(data, already)
-        src = data.get("source", "")
-        self.status.setText(
-            f"Done: '{data.get('word', '')}'"
-            + (f"  [{src}]" if src else "")
-        )
+        src = data.get("source","")
+        self.status.setText(f"Done: '{data.get('word','')}'" + (f"  [{src}]" if src else ""))
 
     def _on_lookup_error(self, msg):
         self.lookup.show_error(msg)
         self.status.setText(f"Error: {msg}")
 
     def _on_save(self, data):
-        self.db.save(
-            data.get("word", ""),
-            data.get("pos", ""),
-            data.get("meaning", ""),
-            data.get("example_de", ""),
-            data.get("example_en", ""),
-        )
+        self.db.save(data)
         self.lookup.mark_saved()
         self.vocab_panel.refresh()
-        self.status.setText(f"Saved: {data.get('word', '')}")
+        self.status.setText(f"Saved: {data.get('word','')}")
 
 
 # ─────────────────────────────────────────────
@@ -752,7 +947,6 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-
     palette = QPalette()
     palette.setColor(QPalette.ColorRole.Window,          QColor("#F9F9F9"))
     palette.setColor(QPalette.ColorRole.WindowText,      QColor("#1A1A1A"))
@@ -764,7 +958,6 @@ if __name__ == "__main__":
     palette.setColor(QPalette.ColorRole.Highlight,       QColor("#4A7DC8"))
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#FFFFFF"))
     app.setPalette(palette)
-
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
