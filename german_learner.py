@@ -835,8 +835,8 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(10,8,10,8)
-        root.setSpacing(6)
+        root.setContentsMargins(10,8,10,0)
+        root.setSpacing(4)
 
         main_split = QSplitter(Qt.Orientation.Horizontal)
         left_split = QSplitter(Qt.Orientation.Vertical)
@@ -891,11 +891,15 @@ class MainWindow(QMainWindow):
         self.vocab_panel = VocabPanel(self.db)
         main_split.addWidget(self.vocab_panel)
         main_split.setSizes([750, 420])
-        root.addWidget(main_split)
+        root.addWidget(main_split, 1)   # stretch=1 so it fills all available space
 
         self.status = QLabel("Ready — paste German text and click 'Load →'")
-        self.status.setStyleSheet("font-size:11px;color:#555;padding:2px 4px;")
-        root.addWidget(self.status)
+        self.status.setFixedHeight(20)
+        self.status.setStyleSheet(
+            "font-size:11px; color:#555; padding:0 4px; "
+            "border-top: 1px solid #E0E0EC; background: #F7F7FA;"
+        )
+        root.addWidget(self.status, 0)  # stretch=0 → only takes what it needs
 
     def _switch_to_reader(self):
         text = self.editor.toPlainText().strip()
