@@ -1,4 +1,3 @@
-
 """
 German Learning Assistant — PyQt6 Desktop App
 Requirements: pip install PyQt6 deep-translator google-genai python-dotenv
@@ -166,6 +165,11 @@ class VocabDB:
         self.conn.execute("DELETE FROM vocab WHERE id=?", (word_id,))
         self.conn.commit()
 
+
+    def clear_all(self):
+        self.conn.execute("DELETE FROM vocab")
+        self.conn.commit()
+
     def exists(self, word):
         cur = self.conn.execute("SELECT 1 FROM vocab WHERE LOWER(word)=LOWER(?)", (word,))
         return cur.fetchone() is not None
@@ -178,21 +182,50 @@ class LookupWorker(QThread):
     result_ready = pyqtSignal(dict)
     error        = pyqtSignal(str)
 
-    def __init__(self, text, context_sentence, is_phrase):
+    def __init__(self, text, context_sentence, is_phrase, google_only=False):
         super().__init__()
         self.text             = text
         self.context_sentence = context_sentence
         self.is_phrase        = is_phrase
+        self.google_only      = google_only
 
     def run(self):
         try:
-            if self.is_phrase:
+            if self.google_only:
+                self._google_translate_only()
+            elif self.is_phrase:
                 self._translate_phrase()
             else:
                 self._lookup_word()
         except Exception as e:
             self.error.emit(f"Unexpected error: {e}")
 
+
+    def _google_translate_only(self):
+        try:
+            translator = GoogleTranslator(source="de", target="en")
+            translation = translator.translate(self.text)
+
+            payload = {
+                "word": self.text,
+                "context_meaning": translation,
+                "source": "Google Translate",
+            }
+
+            if self.is_phrase:
+                payload["is_phrase"] = True
+                payload["example_de"] = self.text
+                payload["example_en"] = translation
+            else:
+                payload["is_phrase"] = False
+                payload["part_of_speech"] = "translation"
+                payload["example_de"] = self.context_sentence or ""
+                payload["example_en"] = translator.translate(self.context_sentence) if self.context_sentence else ""
+
+            self.result_ready.emit(payload)
+        except Exception as e:
+            self.error.emit(f"Translation failed: {e}")
+    
     def _translate_phrase(self):
         if GEMINI_API_KEY:
             result = self._try_gemini(is_phrase=True)
@@ -203,7 +236,10 @@ class LookupWorker(QThread):
             translation = GoogleTranslator(source="de", target="en").translate(self.text)
             self.result_ready.emit({
                 "word": self.text, "is_phrase": True,
-                "context_meaning": translation, "source": "Google Translate",
+                "context_meaning": translation,
+                "example_de": self.text,
+                "example_en": translation,
+                "source": "Google Translate",
             })
         except Exception as e:
             self.error.emit(f"Translation failed: {e}")
@@ -277,12 +313,15 @@ class LookupWorker(QThread):
 
     def _fallback_translate(self):
         try:
-            translation = GoogleTranslator(source="de", target="en").translate(self.text)
+            translator = GoogleTranslator(source="de", target="en")
+            translation = translator.translate(self.text)
+            example_de = self.context_sentence or ""
             self.result_ready.emit({
                 "word": self.text, "is_phrase": False,
                 "part_of_speech": "translation",
                 "context_meaning": translation,
-                "example_de": self.context_sentence or "",
+                "example_de": example_de,
+                "example_en": translator.translate(example_de) if example_de else "",
                 "source": "Google Translate",
             })
         except Exception as e:
@@ -808,6 +847,14 @@ class VocabPanel(QFrame):
         export_btn.setFixedHeight(28)
         export_btn.clicked.connect(self.export_csv)
         btn_row.addWidget(export_btn)
+
+        self.clear_btn = QPushButton("Clear Vocab")
+        self.clear_btn.setFixedHeight(28)
+        self.clear_btn.setStyleSheet("color:#FFFFFF;background:#C65A5A;")
+        self.clear_btn.clicked.connect(self.clear_vocab)
+        btn_row.addWidget(self.clear_btn)
+
+        btn_row.addStretch()
         layout.addLayout(btn_row)
 
     def refresh(self):
@@ -863,6 +910,20 @@ class VocabPanel(QFrame):
         self.db.delete(row_id)
         self.refresh()
 
+
+    def clear_vocab(self):
+        reply = QMessageBox.question(
+            self,
+            "Clear Vocabulary",
+            "Delete all saved vocabulary entries?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.db.clear_all()
+        self.refresh()
+        QMessageBox.information(self, "Cleared", "Saved vocabulary has been cleared.")
     def export_csv(self):
         path, _ = QFileDialog.getSaveFileName(self, "Export Vocabulary", "vocab.csv", "CSV files (*.csv)")
         if path:
@@ -882,6 +943,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.db     = VocabDB()
         self.worker = None
+
+        self.google_only_enabled = False
         self.setWindowTitle("German Learning Assistant")
         self.resize(1200, 720)
         self._build_ui()
@@ -918,6 +981,14 @@ class MainWindow(QMainWindow):
         self.edit_btn.setVisible(False)
         self.edit_btn.clicked.connect(self._switch_to_editor)
         hdr.addWidget(self.edit_btn)
+
+        self.google_only_btn = QPushButton("Google Only")
+        self.google_only_btn.setCheckable(True)
+        self.google_only_btn.setFixedHeight(26)
+        self.google_only_btn.setToolTip("Bypass Gemini and always use Google Translate")
+        self.google_only_btn.toggled.connect(self._on_google_only_toggled)
+        hdr.addWidget(self.google_only_btn)
+
         in_layout.addLayout(hdr)
 
         self.editor = QTextEdit()
@@ -972,13 +1043,17 @@ class MainWindow(QMainWindow):
         self.load_btn.setVisible(True)
         self.edit_btn.setVisible(False)
 
+    def _on_google_only_toggled(self, checked):
+        self.google_only_enabled = checked
+        self.status.setText("Google Translate only mode: ON" if checked else "Google Translate only mode: OFF")
+
     def _on_text_selected(self, text, context, is_phrase):
         self.status.setText("Translating…" if is_phrase else f"Looking up '{text}'…")
         self.lookup.show_loading(text, is_phrase)
         if self.worker and self.worker.isRunning():
             print("Worker busy, skipping")
             return
-        self.worker = LookupWorker(text, context, is_phrase)
+        self.worker = LookupWorker(text, context, is_phrase, google_only=self.google_only_btn.isChecked())
         self.worker.result_ready.connect(self._on_lookup_result)
         self.worker.error.connect(self._on_lookup_error)
         self.worker.start()
@@ -1188,6 +1263,11 @@ class VocabDB:
         self.conn.execute("DELETE FROM vocab WHERE id=?", (word_id,))
         self.conn.commit()
 
+
+    def clear_all(self):
+        self.conn.execute("DELETE FROM vocab")
+        self.conn.commit()
+
     def exists(self, word):
         cur = self.conn.execute("SELECT 1 FROM vocab WHERE LOWER(word)=LOWER(?)", (word,))
         return cur.fetchone() is not None
@@ -1200,21 +1280,50 @@ class LookupWorker(QThread):
     result_ready = pyqtSignal(dict)
     error        = pyqtSignal(str)
 
-    def __init__(self, text, context_sentence, is_phrase):
+    def __init__(self, text, context_sentence, is_phrase, google_only=False):
         super().__init__()
         self.text             = text
         self.context_sentence = context_sentence
         self.is_phrase        = is_phrase
+        self.google_only      = google_only
 
     def run(self):
         try:
-            if self.is_phrase:
+            if self.google_only:
+                self._google_translate_only()
+            elif self.is_phrase:
                 self._translate_phrase()
             else:
                 self._lookup_word()
         except Exception as e:
             self.error.emit(f"Unexpected error: {e}")
 
+
+    def _google_translate_only(self):
+        try:
+            translator = GoogleTranslator(source="de", target="en")
+            translation = translator.translate(self.text)
+
+            payload = {
+                "word": self.text,
+                "context_meaning": translation,
+                "source": "Google Translate",
+            }
+
+            if self.is_phrase:
+                payload["is_phrase"] = True
+                payload["example_de"] = self.text
+                payload["example_en"] = translation
+            else:
+                payload["is_phrase"] = False
+                payload["part_of_speech"] = "translation"
+                payload["example_de"] = self.context_sentence or ""
+                payload["example_en"] = translator.translate(self.context_sentence) if self.context_sentence else ""
+
+            self.result_ready.emit(payload)
+        except Exception as e:
+            self.error.emit(f"Translation failed: {e}")
+    
     def _translate_phrase(self):
         if GEMINI_API_KEY:
             result = self._try_gemini(is_phrase=True)
@@ -1225,7 +1334,10 @@ class LookupWorker(QThread):
             translation = GoogleTranslator(source="de", target="en").translate(self.text)
             self.result_ready.emit({
                 "word": self.text, "is_phrase": True,
-                "context_meaning": translation, "source": "Google Translate",
+                "context_meaning": translation,
+                "example_de": self.text,
+                "example_en": translation,
+                "source": "Google Translate",
             })
         except Exception as e:
             self.error.emit(f"Translation failed: {e}")
@@ -1299,12 +1411,15 @@ class LookupWorker(QThread):
 
     def _fallback_translate(self):
         try:
-            translation = GoogleTranslator(source="de", target="en").translate(self.text)
+            translator = GoogleTranslator(source="de", target="en")
+            translation = translator.translate(self.text)
+            example_de = self.context_sentence or ""
             self.result_ready.emit({
                 "word": self.text, "is_phrase": False,
                 "part_of_speech": "translation",
                 "context_meaning": translation,
-                "example_de": self.context_sentence or "",
+                "example_de": example_de,
+                "example_en": translator.translate(example_de) if example_de else "",
                 "source": "Google Translate",
             })
         except Exception as e:
@@ -1830,6 +1945,14 @@ class VocabPanel(QFrame):
         export_btn.setFixedHeight(28)
         export_btn.clicked.connect(self.export_csv)
         btn_row.addWidget(export_btn)
+
+        self.clear_btn = QPushButton("Clear Vocab")
+        self.clear_btn.setFixedHeight(28)
+        self.clear_btn.setStyleSheet("color:#FFFFFF;background:#C65A5A;")
+        self.clear_btn.clicked.connect(self.clear_vocab)
+        btn_row.addWidget(self.clear_btn)
+
+        btn_row.addStretch()
         layout.addLayout(btn_row)
 
     def refresh(self):
@@ -1885,6 +2008,20 @@ class VocabPanel(QFrame):
         self.db.delete(row_id)
         self.refresh()
 
+
+    def clear_vocab(self):
+        reply = QMessageBox.question(
+            self,
+            "Clear Vocabulary",
+            "Delete all saved vocabulary entries?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.db.clear_all()
+        self.refresh()
+        QMessageBox.information(self, "Cleared", "Saved vocabulary has been cleared.")
     def export_csv(self):
         path, _ = QFileDialog.getSaveFileName(self, "Export Vocabulary", "vocab.csv", "CSV files (*.csv)")
         if path:
@@ -1904,6 +2041,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.db     = VocabDB()
         self.worker = None
+
+        self.google_only_enabled = False
         self.setWindowTitle("German Learning Assistant")
         self.resize(1200, 720)
         self._build_ui()
@@ -1940,6 +2079,14 @@ class MainWindow(QMainWindow):
         self.edit_btn.setVisible(False)
         self.edit_btn.clicked.connect(self._switch_to_editor)
         hdr.addWidget(self.edit_btn)
+
+        self.google_only_btn = QPushButton("Google Only")
+        self.google_only_btn.setCheckable(True)
+        self.google_only_btn.setFixedHeight(26)
+        self.google_only_btn.setToolTip("Bypass Gemini and always use Google Translate")
+        self.google_only_btn.toggled.connect(self._on_google_only_toggled)
+        hdr.addWidget(self.google_only_btn)
+
         in_layout.addLayout(hdr)
 
         self.editor = QTextEdit()
@@ -1994,13 +2141,17 @@ class MainWindow(QMainWindow):
         self.load_btn.setVisible(True)
         self.edit_btn.setVisible(False)
 
+    def _on_google_only_toggled(self, checked):
+        self.google_only_enabled = checked
+        self.status.setText("Google Translate only mode: ON" if checked else "Google Translate only mode: OFF")
+
     def _on_text_selected(self, text, context, is_phrase):
         self.status.setText("Translating…" if is_phrase else f"Looking up '{text}'…")
         self.lookup.show_loading(text, is_phrase)
         if self.worker and self.worker.isRunning():
             print("Worker busy, skipping")
             return
-        self.worker = LookupWorker(text, context, is_phrase)
+        self.worker = LookupWorker(text, context, is_phrase, google_only=self.google_only_btn.isChecked())
         self.worker.result_ready.connect(self._on_lookup_result)
         self.worker.error.connect(self._on_lookup_error)
         self.worker.start()
