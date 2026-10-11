@@ -96,14 +96,35 @@ FULL_COLUMNS = [
     "example_de", "example_en", "source", "added_at",
 ]
 
-CSV_HEADERS = [
-    "Word", "Lemma", "Part of Speech", "Gender", "Plural",
-    "Meaning (in context)", "Other Meanings", "CEFR", "Pronunciation (IPA)",
-    "Conjugation", "Comparison",
-    "Synonyms", "Antonyms", "Word Family", "Collocations", "Common Phrases",
-    "Grammar Notes", "Common Mistakes", "Memory Tip",
-    "Example (DE)", "Example (EN)", "Source", "Saved At",
+# Export order, tuned for reading on a phone: the first few columns carry
+# everything you need to learn the word; reference material follows.
+# (database column, CSV header)
+EXPORT_SPEC = [
+    ("gender",          "Gender"),
+    ("word",            "Word"),
+    ("context_meaning", "Meaning (in context)"),
+    ("part_of_speech",  "Part of Speech"),
+    ("plural",          "Plural"),
+    ("memory_tip",      "Memory Tip"),
+    ("example_de",      "Example (DE)"),
+    ("example_en",      "Example (EN)"),
+    ("cefr_level",      "CEFR"),
+    ("pronunciation",   "Pronunciation (IPA)"),
+    ("other_meanings",  "Other Meanings"),
+    ("collocations",    "Collocations"),
+    ("common_phrases",  "Common Phrases"),
+    ("synonyms",        "Synonyms"),
+    ("antonyms",        "Antonyms"),
+    ("word_family",     "Word Family"),
+    ("conjugation",     "Conjugation"),
+    ("comparison",      "Comparison"),
+    ("grammar_notes",   "Grammar Notes"),
+    ("common_mistakes", "Common Mistakes"),
+    ("lemma",           "Lemma"),
+    ("source",          "Source"),
+    ("added_at",        "Saved At"),
 ]
+CSV_HEADERS = [h for _, h in EXPORT_SPEC]
 
 
 # ─────────────────────────────────────────────
@@ -1062,8 +1083,9 @@ class VocabPanel(QFrame):
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
                 w = csv.writer(f)
                 w.writerow(CSV_HEADERS)
+                idx = {c: i for i, c in enumerate(FULL_COLUMNS)}
                 for row in self.db.all_full():
-                    w.writerow([to_csv_cell(cell) for cell in row])
+                    w.writerow([to_csv_cell(row[idx[col]]) for col, _ in EXPORT_SPEC])
             QMessageBox.information(
                 self, "Exported",
                 f"Saved to {path}\n\nAll {len(CSV_HEADERS)} fields exported, UTF-8 with BOM."
