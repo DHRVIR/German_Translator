@@ -6,7 +6,7 @@ Requirements:
     (optional offline TTS fallback)  pip install pyttsx3
 """
 
-import sys, re, sqlite3, json, csv, os, tempfile, hashlib
+import sys, re, sqlite3, json, csv, os, tempfile, hashlib, time
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -20,14 +20,15 @@ from PyQt6.QtGui import (
     QFont, QColor, QTextCursor, QTextCharFormat, QPalette, QCursor
 )
 
-from google.genai import types
-from google import genai
 from deep_translator import GoogleTranslator
+# NOTE: google.genai is imported lazily inside LookupWorker._try_gemini, so the
+# ~30 MB it costs is only paid when Gemini is actually used (never in Google-only mode).
 from dotenv import load_dotenv
 
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DB_PATH = Path.home() / ".german_learner_vocab.db"
+MEMORY_PATH = Path.home() / ".german_learner_memory.db"   # local cache of Gemini answers
 TTS_CACHE_DIR = Path(tempfile.gettempdir()) / "german_learner_tts"
 TTS_CACHE_DIR.mkdir(exist_ok=True)
 
@@ -257,6 +258,74 @@ class VocabDB:
 
 
 # ─────────────────────────────────────────────
+#  Local memory (Gemini answers only)
+# ─────────────────────────────────────────────
+class LookupMemory:
+    """Tiny local store of past Gemini answers (plain sqlite3, no new library).
+
+    Lookup order in the app: this memory -> Gemini. Only results whose source
+    is "Gemini" are ever stored; Google Translate output never is.
+    A fresh connection is opened per call, so it is safe from any worker thread.
+    """
+
+    @staticmethod
+    def _norm(s):
+        return " ".join((s or "").split()).casefold()
+
+    @classmethod
+    def _key(cls, text, context, is_phrase):
+        # A word's meaning depends on its sentence, so the sentence is part of the key.
+        return f"{'P' if is_phrase else 'W'}|{cls._norm(text)}|{cls._norm(context)}"
+
+    @staticmethod
+    def _connect():
+        conn = sqlite3.connect(str(MEMORY_PATH), timeout=5)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory (
+                key        TEXT PRIMARY KEY,
+                payload    TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        return conn
+
+    @classmethod
+    def get(cls, text, context, is_phrase):
+        try:
+            conn = cls._connect()
+            try:
+                row = conn.execute(
+                    "SELECT payload FROM memory WHERE key=?",
+                    (cls._key(text, context, is_phrase),),
+                ).fetchone()
+            finally:
+                conn.close()
+            return json.loads(row[0]) if row else None
+        except Exception as e:
+            print("Memory read error:", e)
+            return None
+
+    @classmethod
+    def put(cls, text, context, is_phrase, data):
+        if data.get("source") != "Gemini":      # never store anything but Gemini output
+            return False
+        try:
+            conn = cls._connect()
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO memory (key, payload) VALUES (?, ?)",
+                    (cls._key(text, context, is_phrase), json.dumps(data, ensure_ascii=False)),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            return True
+        except Exception as e:
+            print("Memory write error:", e)
+            return False
+
+
+# ─────────────────────────────────────────────
 #  Text-to-speech worker
 # ─────────────────────────────────────────────
 class SpeakWorker(QThread):
@@ -303,6 +372,10 @@ class SpeakWorker(QThread):
 # ─────────────────────────────────────────────
 #  Lookup worker
 # ─────────────────────────────────────────────
+class _Cancelled(Exception):
+    """Raised inside a worker when a newer click superseded it."""
+
+
 class LookupWorker(QThread):
     result_ready = pyqtSignal(dict)
     error        = pyqtSignal(str)
@@ -313,15 +386,16 @@ class LookupWorker(QThread):
         self.context_sentence = context_sentence
         self.is_phrase        = is_phrase
         self.google_only      = google_only
+        self._gemini_error    = ""
 
     def run(self):
         try:
             if self.google_only:
                 self._google_translate_only()
-            elif self.is_phrase:
-                self._translate_phrase()
             else:
-                self._lookup_word()
+                self._lookup_memory_then_gemini()
+        except _Cancelled:
+            pass                      # superseded by a newer click: stay silent
         except Exception as e:
             self.error.emit(f"Unexpected error: {e}")
 
@@ -350,31 +424,28 @@ class LookupWorker(QThread):
         except Exception as e:
             self.error.emit(f"Translation failed: {e}")
 
-    def _translate_phrase(self):
-        if GEMINI_API_KEY:
-            result = self._try_gemini(is_phrase=True)
-            if result:
-                self.result_ready.emit(result)
-                return
-        try:
-            translation = GoogleTranslator(source="de", target="en").translate(self.text)
-            self.result_ready.emit({
-                "word": self.text, "is_phrase": True,
-                "context_meaning": translation,
-                "example_de": self.text,
-                "example_en": translation,
-                "source": "Google Translate",
-            })
-        except Exception as e:
-            self.error.emit(f"Translation failed: {e}")
+    def _lookup_memory_then_gemini(self):
+        """1) local memory  ->  2) Gemini  ->  3) on failure: show error only.
+        Google Translate is NEVER used here; that is the "Google Only" button's job."""
+        hint = "  Try the 'Google Only' button for a simple translation."
 
-    def _lookup_word(self):
-        if GEMINI_API_KEY:
-            result = self._try_gemini(is_phrase=False)
-            if result:
-                self.result_ready.emit(result)
-                return
-        self._fallback_translate()
+        cached = LookupMemory.get(self.text, self.context_sentence, self.is_phrase)
+        if cached:
+            cached["from_memory"] = True
+            self.result_ready.emit(cached)
+            return
+
+        if not GEMINI_API_KEY:
+            self.error.emit("No GEMINI_API_KEY found in .env." + hint)
+            return
+
+        result = self._try_gemini(is_phrase=self.is_phrase)
+        if result:
+            LookupMemory.put(self.text, self.context_sentence, self.is_phrase, result)
+            self.result_ready.emit(result)
+        else:
+            reason = self._gemini_error or "Gemini did not respond."
+            self.error.emit(f"{reason}{hint}")
 
     def _build_gemini_prompt(self, is_phrase=False):
         ctx = ""
@@ -401,10 +472,22 @@ class LookupWorker(QThread):
         return GEMINI_PROMPT + ctx + f"\nExact selected word: {self.text}"
 
     def _try_gemini(self, is_phrase=False):
+        """Ask Gemini. Returns a dict, or None on timeout/any API failure.
+
+        The wait is polled in 0.2 s slices so that (a) the timeout really is a
+        timeout and (b) a newer click can cancel this lookup immediately.
+        """
         import concurrent.futures
+        timeout = GEMINI_TIMEOUT_SECONDS_PHRASE if is_phrase else GEMINI_TIMEOUT_SECONDS_WORD
 
         def _call():
-            client = genai.Client(api_key=GEMINI_API_KEY)
+            from google import genai            # lazy import
+            from google.genai import types
+            client = genai.Client(
+                api_key=GEMINI_API_KEY,
+                # also cap the HTTP call itself (milliseconds) so no thread lingers
+                http_options=types.HttpOptions(timeout=int(timeout * 1000)),
+            )
             prompt = self._build_gemini_prompt(is_phrase=is_phrase)
             response = client.models.generate_content(
                 model="gemma-4-26b-a4b-it",
@@ -419,19 +502,27 @@ class LookupWorker(QThread):
                      if not getattr(p, "thought", False) and getattr(p, "text", None)]
             return "\n".join(parts).strip()
 
+        # NOT a `with` block: its exit waits for the call to finish, which silently
+        # defeats the timeout.
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                future = ex.submit(_call)
-                try:
-                    timeout = GEMINI_TIMEOUT_SECONDS_PHRASE if is_phrase else GEMINI_TIMEOUT_SECONDS_WORD
-                    raw = future.result(timeout=timeout)
-                except concurrent.futures.TimeoutError:
+            future = ex.submit(_call)
+            deadline = time.monotonic() + timeout
+            while not future.done():
+                concurrent.futures.wait([future], timeout=0.2)
+                if self.isInterruptionRequested():
+                    raise _Cancelled()
+                if time.monotonic() >= deadline:
+                    print(f"Gemini timed out after {timeout}s")
+                    self._gemini_error = f"Gemini timed out after {timeout}s."
                     return None
+            raw = future.result()
 
             raw = re.sub(r"^```[a-z]*\n?", "", raw)
             raw = re.sub(r"\n?```$", "", raw)
             m = re.search(r"\{.*\}", raw, re.DOTALL)
             if not m:
+                self._gemini_error = "Gemini returned an unreadable answer."
                 return None
             data = json.loads(m.group(0))
             data["is_phrase"] = is_phrase
@@ -439,25 +530,14 @@ class LookupWorker(QThread):
             if not is_phrase:
                 data["word"] = self.text   # never let the model widen the selection
             return data
+        except _Cancelled:
+            raise
         except Exception as e:
             print("Gemini error:", e)
+            self._gemini_error = f"Gemini error: {e}"
             return None
-
-    def _fallback_translate(self):
-        try:
-            translator = GoogleTranslator(source="de", target="en")
-            translation = translator.translate(self.text)
-            example_de  = self.context_sentence or ""
-            self.result_ready.emit({
-                "word": self.text, "is_phrase": False,
-                "part_of_speech": "translation",
-                "context_meaning": translation,
-                "example_de": example_de,
-                "example_en": translator.translate(example_de) if example_de else "",
-                "source": "Google Translate",
-            })
-        except Exception as e:
-            self.error.emit(f"Lookup failed: {e}")
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
 
 
 # ─────────────────────────────────────────────
@@ -621,7 +701,9 @@ class LookupPanel(QFrame):
             self.source_badge.setStyleSheet(
                 f"color:#FFF;background:{color};border-radius:8px;padding:2px 10px;font-size:10px;"
             )
-            self.source_badge.setText(f"via {source}")
+            self.source_badge.setText(
+                f"via {source} (memory)" if data.get("from_memory") else f"via {source}"
+            )
             self.source_badge.setVisible(True)
 
         self.speak_btn.setVisible(bool(data.get("word")))
@@ -1101,7 +1183,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.db            = VocabDB()
-        self.worker        = None
+        self._workers      = set()     # running lookups (old ones are cancelled, not dropped)
+        self._req_id       = 0         # newest request wins; older answers are ignored
+        self._last_request = None      # (text, context, is_phrase) of the latest click
         self.speak_worker  = None
         self.player        = None
         self.audio_out     = None
@@ -1155,7 +1239,12 @@ class MainWindow(QMainWindow):
         self.google_only_btn = QPushButton("Google Only")
         self.google_only_btn.setCheckable(True)
         self.google_only_btn.setFixedHeight(26)
-        self.google_only_btn.setToolTip("Bypass Gemini and always use Google Translate")
+        self.google_only_btn.setMinimumWidth(104)
+        self.google_only_btn.setStyleSheet(
+            "QPushButton:checked { background:#5B8DD9; color:#FFFFFF; font-weight:bold; "
+            "border:1px solid #3F6FB8; border-radius:3px; }"
+        )
+        self.google_only_btn.setToolTip("Skip memory and Gemini; use basic Google Translate (needs internet). Results are not saved to memory.")
         self.google_only_btn.toggled.connect(self._on_google_only_toggled)
         hdr.addWidget(self.google_only_btn)
         in_layout.addLayout(hdr)
@@ -1220,37 +1309,57 @@ class MainWindow(QMainWindow):
         self.speak_text_btn.setVisible(False)
 
     def _on_google_only_toggled(self, checked):
-        self.status.setText(
-            "Google Translate only mode: ON" if checked else "Google Translate only mode: OFF"
-        )
+        self.google_only_btn.setText("✓ Google Only" if checked else "Google Only")
+        if self._last_request:
+            # re-run the word/phrase you are looking at, in the new mode
+            self._start_lookup(*self._last_request)
+        else:
+            self.status.setText(
+                "Google Translate only: ON" if checked else "Google Translate only: OFF (Gemini)"
+            )
 
     # ── lookup ───────────────────────────────────────────────────────
     def _on_text_selected(self, text, context, is_phrase):
-        self.status.setText("Translating…" if is_phrase else f"Looking up '{text}'…")
-        self.lookup.show_loading(text, is_phrase)
-        if self.worker and self.worker.isRunning():
-            print("Worker busy, skipping")
-            return
-        self.worker = LookupWorker(
-            text, context, is_phrase, google_only=self.google_only_btn.isChecked()
-        )
-        self.worker.result_ready.connect(self._on_lookup_result)
-        self.worker.error.connect(self._on_lookup_error)
-        self.worker.start()
+        self._start_lookup(text, context, is_phrase)
 
-    def _on_lookup_result(self, data):
+    def _start_lookup(self, text, context, is_phrase):
+        for old in self._workers:
+            old.requestInterruption()          # superseded: stop it quietly
+        self._req_id += 1
+        rid = self._req_id
+        self._last_request = (text, context, is_phrase)
+
+        google_only = self.google_only_btn.isChecked()
+        via   = "Google Translate" if google_only else "memory/Gemini"
+        verb  = "Translating" if is_phrase else "Looking up"
+        short = text if len(text) <= 40 else text[:38] + "…"
+        self.status.setText(f"{verb} '{short}' via {via}…")
+        self.lookup.show_loading(text, is_phrase)
+
+        w = LookupWorker(text, context, is_phrase, google_only=google_only)
+        w.result_ready.connect(lambda data, rid=rid, text=text: self._on_lookup_result(data, rid, text))
+        w.error.connect(lambda msg, rid=rid: self._on_lookup_error(msg, rid))
+        w.finished.connect(lambda w=w: self._workers.discard(w))
+        w.finished.connect(w.deleteLater)
+        self._workers.add(w)
+        w.start()
+
+    def _on_lookup_result(self, data, rid, text):
+        if rid != self._req_id:
+            return                              # stale answer from an older click
         if not data.get("is_phrase", False):
-            selected_word = getattr(self.worker, "text", "") if self.worker else ""
-            if selected_word:
-                data["word"] = selected_word
+            data["word"] = text
         already = self.db.exists(data.get("word", ""))
         self.lookup.show_result(data, already)
         src = data.get("source", "")
         self.status.setText(
-            f"Done: '{data.get('word', '')}'" + (f"  [{src}]" if src else "")
+            f"Done: '{data.get('word', '')}'"
+            + (f"  [{src}{' · memory' if data.get('from_memory') else ''}]" if src else "")
         )
 
-    def _on_lookup_error(self, msg):
+    def _on_lookup_error(self, msg, rid):
+        if rid != self._req_id:
+            return
         self.lookup.show_error(msg)
         self.status.setText(f"Error: {msg}")
 
@@ -1261,6 +1370,13 @@ class MainWindow(QMainWindow):
         self.status.setText(
             f"Saved (all fields): {data.get('word', '')}" if ok else "Save failed"
         )
+
+    def closeEvent(self, event):
+        for w in list(self._workers):
+            w.requestInterruption()
+        for w in list(self._workers):
+            w.wait(1500)
+        super().closeEvent(event)
 
     # ── read aloud ───────────────────────────────────────────────────
     def _on_read_aloud(self):
